@@ -7,7 +7,6 @@ from typing import Tuple
 
 @dataclass
 class RenderSettings:
-    """Minimal structure for resolution and tonemapping parameters."""
     resolution: Tuple[int, int] = (1280, 720)
     exposure: float = -0.25
     gamma: float = 2.2
@@ -15,8 +14,6 @@ class RenderSettings:
 
 @dataclass
 class CameraSettings:
-    """Holds camera origin, orientation, and integration controls."""
-
     position: Tuple[float, float, float] = (0.0, -22.0, 2.5)
     forward: Tuple[float, float, float] = (0.0, 0.993, -0.118)
     up: Tuple[float, float, float] = (0.0, 0.0, 1.0)
@@ -27,8 +24,6 @@ class CameraSettings:
 
 @dataclass
 class BlackHoleSettings:
-    """Stores mass, horizon epsilon, and disk geometry for the scene."""
-
     mass: float = 1.0
     horizon_epsilon: float = 5e-4
     disk_inner_radius: float = 6.0
@@ -38,8 +33,6 @@ class BlackHoleSettings:
 
 @dataclass
 class IntegrationSettings:
-    """Collects RK4 step size, max steps, and termination thresholds."""
-
     step_size: float = 0.015
     max_steps: int = 1400
     escape_radius: float = 220.0
@@ -47,8 +40,6 @@ class IntegrationSettings:
 
 @dataclass
 class ControllerSettings:
-    """FPS-style controller speeds and sensitivity defaults."""
-
     move_speed: float = 0.8
     boost_multiplier: float = 3.0
     mouse_sensitivity: float = 0.0022
@@ -56,16 +47,12 @@ class ControllerSettings:
 
 @dataclass
 class OutputSettings:
-    """Paths and naming conventions for saved frames."""
-
     screenshot_directory: Path = Path.home() / "Desktop"
     filename_prefix: str = "blackhole"
 
 
 @dataclass
 class SimulationConfig:
-    """Aggregated configuration object passed across modules."""
-
     render: RenderSettings
     camera: CameraSettings
     black_hole: BlackHoleSettings
@@ -74,88 +61,79 @@ class SimulationConfig:
     output: OutputSettings
 
 
-
 def build_reference_config() -> SimulationConfig:
-    render = RenderSettings()
-    camera = CameraSettings()
-    black_hole = BlackHoleSettings()
-    integration = IntegrationSettings()
-    controller = ControllerSettings()
-    output = OutputSettings()
-
     return SimulationConfig(
-        render=render,
-        camera=camera,
-        black_hole=black_hole,
-        integration=integration,
-        controller=controller,
-        output=output,
+        render=RenderSettings(),
+        camera=CameraSettings(),
+        black_hole=BlackHoleSettings(),
+        integration=IntegrationSettings(),
+        controller=ControllerSettings(),
+        output=OutputSettings(),
     )
-
 
 
 def build_development_config(*, resolution_scale: float = 0.5) -> SimulationConfig:
     if resolution_scale <= 0.0:
-        raise ValueError("resolution_scale must be positive.")
+        raise ValueError("resolution_scale must be positive")
 
     base = build_reference_config()
-    scaled_resolution = tuple(
-        max(1, int(round(dim * resolution_scale))) for dim in base.render.resolution
-    )
-    tuned_render = replace(base.render, resolution=scaled_resolution)
-    tuned_integration = replace(
+    scaled_resolution = tuple(max(1, int(round(dim * resolution_scale))) for dim in base.render.resolution)
+    tweaked_render = replace(base.render, resolution=scaled_resolution)
+    tweaked_integration = replace(
         base.integration,
         max_steps=max(1, int(base.integration.max_steps * resolution_scale)),
     )
 
     return SimulationConfig(
-        render=tuned_render,
+        render=tweaked_render,
         camera=replace(base.camera),
         black_hole=replace(base.black_hole),
-        integration=tuned_integration,
+        integration=tweaked_integration,
         controller=replace(base.controller),
         output=replace(base.output),
     )
 
+
 def validate_config(config: SimulationConfig) -> None:
     width, height = config.render.resolution
     if width <= 0 or height <= 0:
-        raise ValueError("Render resolution must be positive in both dimensions.")
+        raise ValueError("resolution must be positive")
 
     if config.render.gamma <= 0.0:
-        raise ValueError("Render gamma must be positive.")
+        raise ValueError("gamma must be positive")
 
     if config.integration.step_size <= 0.0:
-        raise ValueError("Integration step size must be positive.")
+        raise ValueError("step size must be positive")
 
     if config.integration.max_steps <= 0:
-        raise ValueError("Integration max_steps must be a positive integer.")
+        raise ValueError("max_steps must be positive")
 
     if config.integration.escape_radius <= 0.0:
-        raise ValueError("Escape radius must be positive.")
+        raise ValueError("escape radius must be positive")
 
-    if config.camera.vfov_degrees <= 0.0 or config.camera.vfov_degrees >= 180.0:
-        raise ValueError("Camera vertical FOV must be between 0 and 180 degrees.")
+    if not (0.0 < config.camera.vfov_degrees < 180.0):
+        raise ValueError("camera vfov must be between 0 and 180")
 
-    forward = config.camera.forward
-    if forward == (0.0, 0.0, 0.0):
-        raise ValueError("Camera forward vector must be non-zero.")
+    if config.camera.forward == (0.0, 0.0, 0.0):
+        raise ValueError("camera forward cannot be zero")
 
     if config.black_hole.disk_inner_radius <= 0.0:
-        raise ValueError("Disk inner radius must be positive.")
+        raise ValueError("disk inner radius must be positive")
 
     if config.black_hole.disk_outer_radius <= config.black_hole.disk_inner_radius:
-        raise ValueError("Disk outer radius must exceed inner radius.")
+        raise ValueError("disk outer radius must exceed inner radius")
 
     if config.black_hole.horizon_epsilon <= 0.0:
-        raise ValueError("Horizon epsilon must be positive.")
+        raise ValueError("horizon epsilon must be positive")
 
     if config.controller.move_speed <= 0.0:
-        raise ValueError("Controller move_speed must be positive.")
+        raise ValueError("controller move_speed must be positive")
 
     if config.controller.mouse_sensitivity <= 0.0:
-        raise ValueError("Controller mouse_sensitivity must be positive.")
+        raise ValueError("mouse sensitivity must be positive")
 
     screenshot_dir = config.output.screenshot_directory.expanduser()
     if screenshot_dir.exists() and not screenshot_dir.is_dir():
-        raise ValueError("Screenshot directory path collides with a non-directory entry.")
+        raise ValueError("screenshot path collides with a non-directory")
+
+
