@@ -1,87 +1,146 @@
-"""Physics utilities for Schwarzschild spacetime integration.
-
-This module packages the mathematical primitives that power the ray
-integrator: metric tensors, Christoffel symbols, geodesic RHS evaluation,
-and a simple RK4 advance routine. The Taichi kernel will call into these
-helpers (either directly or through thin wrappers) to bend camera rays
-around the black hole before shading.
-"""
+"""Physics helpers for bending rays in Schwarzschild spacetime."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Callable, Tuple
+from typing import Callable, Dict, Tuple
+
+Coord4 = Tuple[float, float, float, float]
 
 
 @dataclass
 class GeodesicState:
-    """Lightweight container for position/momentum evolution along a geodesic."""
-
-    position: Tuple[float, float, float, float]
-    momentum: Tuple[float, float, float, float]
+    position: Coord4
+    momentum: Coord4
 
 
-def schwarzschild_metric(position: Tuple[float, float, float, float], mass: float):
-    # Computes the covariant metric tensor g_mu_nu at a spacetime event.
-    # Provides core curvature data that the integrator and redshift logic rely on.
-    # Consumes config.black_hole.mass from `SimulationConfig`; called by geodesic_rhs.
-    # Implementation outline:
-    # - Convert the spatial part of `position` into Schwarzschild r, theta.
-    # - Evaluate the diagonal metric components (f, -1/f, -r^2, -r^2 sin^2 theta).
-    # - Express the result as a 4x4 structure compatible with Taichi/Numpy.
-    raise NotImplementedError
+def schwarzschild_metric(pos: Coord4, mass: float, horizon_epsilon: float = 1e-8):
+    # g_mu_nu at a point; we stick to diagonal form in (t, r, theta, phi)
+    _, r, theta, _ = pos
+    if r < 2.0 * mass + horizon_epsilon:
+        r = 2.0 * mass + horizon_epsilon
+
+    lapse = 1.0 - (2.0 * mass) / r
+    sin_theta = math.sin(theta)
+    sin_sq = sin_theta * sin_theta
+
+    return [
+        [-lapse, 0.0, 0.0, 0.0],
+        [0.0, 1.0 / lapse, 0.0, 0.0],
+        [0.0, 0.0, r * r, 0.0],
+        [0.0, 0.0, 0.0, r * r * sin_sq],
+    ]
 
 
 def inverse_metric(metric):
-    # Returns the contravariant metric g^mu_nu for raising indices.
-    # Sits between metric evaluation and any dot-product style operations.
-    # Expects the 4x4 tensor emitted by schwarzschild_metric; reused by redshift/rhs.
-    # Implementation outline:
-    # - Invert the 4x4 matrix analytically or numerically.
-    # - Preserve structure expected by downstream Taichi kernels.
-    raise NotImplementedError
+    # just invert the diagonal elements, sanity-checking zeros
+    g_tt = metric[0][0]
+    g_rr = metric[1][1]
+    g_thth = metric[2][2]
+    g_phph = metric[3][3]
+
+    if not all(abs(x) > 1e-12 for x in (g_tt, g_rr, g_thth, g_phph)):
+        raise ValueError("metric inversion hit a zero-ish entry")
+
+    return [
+        [1.0 / g_tt, 0.0, 0.0, 0.0],
+        [0.0, 1.0 / g_rr, 0.0, 0.0],
+        [0.0, 0.0, 1.0 / g_thth, 0.0],
+        [0.0, 0.0, 0.0, 1.0 / g_phph],
+    ]
 
 
-def christoffel_symbols(position: Tuple[float, float, float, float], mass: float):
-    # Computes Γ^μ_{νρ} at the given spacetime point.
-    # Supplies connection coefficients to the geodesic RHS to describe curvature forces.
-    # Depends on schwarzschild_metric (and possibly inverse_metric) for partial derivatives.
-    # Implementation outline:
-    # - Differentiate metric components with respect to r and theta.
-    # - Assemble the non-zero Christoffel symbols for Schwarzschild spacetime.
-    # - Emit a compact representation (e.g., nested tuples or custom struct).
-    raise NotImplementedError
+def christoffel_symbols(pos: Coord4, mass: float, tiny: float = 1e-12):
+    # sparse dict: keys are (mu, nu, sigma)
+    T, R, TH, PH = 0, 1, 2, 3
+    _, r, theta, _ = pos
+
+    lapse = 1.0 - 2.0 * mass / r
+    dlapse_dr = 2.0 * mass / (r * r)
+    sin_t = math.sin(theta)
+    cos_t = math.cos(theta)
+    sin_sq = sin_t * sin_t
+
+    safe_sin = sin_t if abs(sin_t) > tiny else (tiny if cos_t >= 0.0 else -tiny)
+
+    gamma: Dict[Tuple[int, int, int], float] = {}
+
+    def set_sym(mu, nu, sigma, value):
+        gamma[(mu, nu, sigma)] = value
+        if sigma != nu:
+            gamma[(mu, sigma, nu)] = value
+
+    set_sym(T, T, R, dlapse_dr / (2.0 * lapse))
+    set_sym(R, T, T, 0.5 * lapse * dlapse_dr)
+    set_sym(R, R, R, -dlapse_dr / (2.0 * lapse))
+    set_sym(R, TH, TH, -lapse * r)
+    set_sym(R, PH, PH, -lapse * r * sin_sq)
+    set_sym(TH, R, TH, 1.0 / r)
+    set_sym(PH, R, PH, 1.0 / r)
+    set_sym(TH, PH, PH, -sin_t * cos_t)
+    set_sym(PH, TH, PH, cos_t / safe_sin)
+
+    return gamma
 
 
 def geodesic_rhs(
     state: GeodesicState,
     mass: float,
-    connection_fn: Callable[[Tuple[float, float, float, float], float], object],
+    connection_fn: Callable[[Coord4, float], Dict[Tuple[int, int, int], float]],
 ):
-    # Evaluates d/dλ (position, momentum) for null geodesics.
-    # Couples metric data with the current state to drive RK4 updates.
-    # Invoked inside rk4_step with christoffel_symbols as connection_fn.
-    # Implementation outline:
-    # - Unpack position/momentum from state and fetch Γ tensors.
-    # - Compute dx^μ/dλ = p^μ and dp^μ/dλ = -Γ^μ_{αβ} p^α p^β.
-    # - Return the derivatives in a structure matching GeodesicState.
-    raise NotImplementedError
+    # derivative wrt affine parameter: dx/dl = p, dp/dl = -Gamma * p * p
+    gamma = connection_fn(state.position, mass)
+    dp = [0.0, 0.0, 0.0, 0.0]
+    for (mu, nu, sigma), value in gamma.items():
+        dp[mu] -= value * state.momentum[nu] * state.momentum[sigma]
+
+    return GeodesicState(position=state.momentum, momentum=tuple(dp))
 
 
 def rk4_step(
     state: GeodesicState,
     mass: float,
     step_size: float,
-    connection_fn: Callable[[Tuple[float, float, float, float], float], object],
+    connection_fn: Callable[[Coord4, float], Dict[Tuple[int, int, int], float]],
 ):
-    # Advances the geodesic state by a single RK4 step of size Δλ.
-    # Bridges geodesic_rhs with IntegrationSettings.step_size for kernel.py.
-    # Uses connection_fn to stay configurable/testing-friendly.
-    # Implementation outline:
-    # - Evaluate rhs at k1..k4 sample points.
-    # - Combine them with RK4 weights to produce the next GeodesicState.
-    # - Preserve the tuple/float layout for Taichi compatibility.
-    raise NotImplementedError
+    # basic rk4 integrator, expanded inline
+    def blend(base, diff, scale):
+        return GeodesicState(
+            position=tuple(base.position[i] + scale * diff.position[i] for i in range(4)),
+            momentum=tuple(base.momentum[i] + scale * diff.momentum[i] for i in range(4)),
+        )
+
+    k1 = geodesic_rhs(state, mass, connection_fn)
+    k2 = geodesic_rhs(blend(state, k1, 0.5 * step_size), mass, connection_fn)
+    k3 = geodesic_rhs(blend(state, k2, 0.5 * step_size), mass, connection_fn)
+    k4 = geodesic_rhs(blend(state, k3, step_size), mass, connection_fn)
+
+    pos = []
+    mom = []
+    for i in range(4):
+        pos.append(
+            state.position[i]
+            + (step_size / 6.0)
+            * (
+                k1.position[i]
+                + 2.0 * k2.position[i]
+                + 2.0 * k3.position[i]
+                + k4.position[i]
+            )
+        )
+        mom.append(
+            state.momentum[i]
+            + (step_size / 6.0)
+            * (
+                k1.momentum[i]
+                + 2.0 * k2.momentum[i]
+                + 2.0 * k3.momentum[i]
+                + k4.momentum[i]
+            )
+        )
+
+    return GeodesicState(position=tuple(pos), momentum=tuple(mom))
 
 
 def integrate_geodesic(
@@ -89,31 +148,35 @@ def integrate_geodesic(
     mass: float,
     step_size: float,
     max_steps: int,
-    connection_fn: Callable[[Tuple[float, float, float, float], float], object],
+    connection_fn: Callable[[Coord4, float], Dict[Tuple[int, int, int], float]],
     termination_fn: Callable[[GeodesicState], bool],
 ):
-    # Runs the geodesic until horizon capture, escape, or iteration limit.
-    # Supplies the scene layer with the final state for shading decisions.
-    # Consumes IntegrationSettings parameters and scene termination predicates.
-    # Implementation outline:
-    # - Initialize an accumulator with initial_state.
-    # - Loop up to max_steps, calling rk4_step each iteration.
-    # - Break when termination_fn signals horizon/disk/escape.
-    # - Return the final GeodesicState plus metadata if needed later.
-    raise NotImplementedError
+    # march the ray until something interesting happens
+    state = initial_state
+    for step_idx in range(max_steps):
+        if termination_fn(state):
+            return state, step_idx
+        state = rk4_step(state, mass, step_size, connection_fn)
+    return state, max_steps
 
 
 def redshift_factor(
-    observer_four_velocity: Tuple[float, float, float, float],
-    emitter_four_velocity: Tuple[float, float, float, float],
-    photon_momentum: Tuple[float, float, float, float],
+    observer_four_velocity: Coord4,
+    emitter_four_velocity: Coord4,
+    photon_momentum: Coord4,
     metric,
 ):
-    # Computes g = (u_obs · p) / (u_em · p) for combined gravitational/Doppler shift.
-    # Feeds scene.py's shading routines to tint the accretion disk.
-    # Requires a metric-compatible inner product; reuse metric/inverse_metric utilities.
-    # Implementation outline:
-    # - Form covariant dot products u·p using the provided metric.
-    # - Guard against division by zero / numerical instability.
-    # - Return the scalar redshift factor to modulate emitted radiance.
-    raise NotImplementedError
+    # g = (u_obs dot p) / (u_em dot p)
+    def covariant_dot(a, b):
+        total = 0.0
+        for mu in range(4):
+            for nu in range(4):
+                total += metric[mu][nu] * a[mu] * b[nu]
+        return total
+
+    num = covariant_dot(observer_four_velocity, photon_momentum)
+    denom = covariant_dot(emitter_four_velocity, photon_momentum)
+    if abs(denom) < 1e-12:
+        raise ZeroDivisionError("redshift factor blew up; emitter dot photon ~= 0")
+    return num / denom
+
